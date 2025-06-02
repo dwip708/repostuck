@@ -1,0 +1,1029 @@
+!pip install resampy
+
+
+
+#Low Pass Booster on Audio Files
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.signal import butter, lfilter, spectrogram, filtfilt
+from scipy.signal import hilbert  # Added missing import
+import soundfile as sf  # Added for WAV file reading/writing
+import os
+
+# Constants (default values)
+P0 = 1.0      # Primary wave amplitude
+m = 0.5       # Modulation index
+a = 0.05      # Loudspeaker radius (meters)
+beta = 1.2    # Nonlinearity coefficient of air
+rho0 = 1.225  # Air density (kg/m^3)
+c0 = 343      # Speed of sound (m/s)
+alpha = 0.002 # Absorption coefficient
+r = 1.0       # Distance from speaker (meters)
+fc = 40e3     # Ultrasonic carrier frequency (Hz)
+fs = 120000    # Sample rate - high enough for ultrasonic carrier
+
+# Generate CHOP Signal (Alternating Signal-Gap)
+def generate_chop_signal(fs, duration=1.0, step=50, min_freq=50, max_freq=1100):
+    t = np.linspace(0, duration, int(fs * duration), endpoint=False)
+    signal = np.zeros_like(t)
+    
+    for freq in range(min_freq, max_freq + 1, step):
+        mask = ((t * freq) % 2) < 1  # Alternating ON-OFF pattern
+        signal[mask] += np.sin(2 * np.pi * freq * t[mask])
+    
+    return signal / np.max(np.abs(signal))  # Normalize
+
+# Generate multi-tone signal with gaps
+def generate_multi_tone_signal(fs, frequencies=None, tone_duration=0.5, gap_duration=0.25):
+    if frequencies is None:
+        frequencies = np.arange(100, 1100, 100)  # 100 Hz to 1000 Hz in steps of 100 Hz
+    
+    signal_segments = []
+    for freq in frequencies:
+        t_tone = np.arange(0, tone_duration, 1/fs)
+        tone = np.sin(2 * np.pi * freq * t_tone)  # Generate sine wave
+        gap = np.zeros(int(fs * gap_duration))  # Generate gap
+        signal_segments.append(np.hstack([tone, gap]))
+    
+    # Concatenate all tones with gaps
+    return np.hstack(signal_segments)
+
+# AM Modulation with physical parameters
+def am_modulate(audio, fs, carrier_freq=fc, amp_factor=5.0):
+    t = np.arange(len(audio)) / fs
+    carrier = np.sin(2 * np.pi * carrier_freq * t)
+    modulated = P0 * (1 + m * audio) * np.exp(-alpha * r) * carrier
+    return modulated * amp_factor
+
+def safe_gradient(signal, fs, n=5):
+    """Savitzky-Golay differentiator"""
+    from scipy.signal import savgol_filter
+    dt = 1/fs
+    return savgol_filter(signal, window_length=n, polyorder=3, deriv=1)/dt
+def air_demodulate(modulated, fs):
+    """Air demodulation based on Berktay's model"""
+    analytic_signal = hilbert(modulated)
+    envelope = np.abs(analytic_signal)
+    squared_envelope = envelope ** 2
+    
+    nyquist = 0.5 * fs
+    cutoff = 0.1 * nyquist
+    b, a_filter = butter(4, cutoff, 'lowpass', fs=fs)
+    filtered_squared = filtfilt(b, a_filter, squared_envelope)
+    
+    dt = 1 / fs
+    second_derivative = np.zeros_like(filtered_squared)
+    second_derivative[1:-1] = (filtered_squared[2:] - 2*filtered_squared[1:-1] + filtered_squared[:-2]) / (dt**2)
+    second_derivative[0] = (filtered_squared[2] - 2*filtered_squared[1] + filtered_squared[0]) / (dt**2)
+    second_derivative[-1] = (filtered_squared[-1] - 2*filtered_squared[-2] + filtered_squared[-3]) / (dt**2)
+    
+    scaling_factor = (beta * P0**2 * a**2) / (16 * rho0 * c0**4 * r)
+    demodulated = scaling_factor * second_derivative
+    
+    audio_cutoff = min(20000, 0.45 * nyquist)
+    b, a_filter = butter(6, audio_cutoff, 'lowpass', fs=fs)
+    demodulated = filtfilt(b, a_filter, demodulated)
+    
+    max_val = np.max(np.abs(demodulated))
+    if max_val > 0:
+        demodulated = demodulated / max_val
+    
+    return demodulated
+
+def advanced_low_freq_booster(audio, fs, boost_factor=2.0, cutoff_freq=500, order=4):
+    """
+    Advanced low-frequency booster with physics-based nonlinear compensation.
+    
+    Parameters:
+    - audio: input audio signal
+    - fs: sampling rate
+    - boost_factor: amount of boost to apply
+    - cutoff_freq: frequency below which to apply the boost
+    - order: filter order (higher = sharper roll-off)
+    
+    Returns:
+    - boosted_audio: the enhanced audio signal
+    - boost_curve: the applied boost curve for analysis
+    """
+    # Frequency analysis
+    freqs = np.fft.rfftfreq(len(audio), 1/fs)
+    fft_data = np.fft.rfft(audio)
+    
+    # Create boost curve
+    boost_curve = np.ones_like(freqs, dtype=float)
+    mask = freqs <= cutoff_freq
+
+    # Base boost function (improved logarithmic scaling)
+    base_boost = boost_factor * np.log1p(1 + (cutoff_freq - freqs[mask]) / cutoff_freq) 
+
+    # Nonlinear AI compensation: Adjusting for demodulation and AI-induced loss
+    nonlinear_comp = np.maximum(1, (cutoff_freq / (freqs[mask] + 1e-3)) ** 0.75)
+    
+    # Frequency warping compensation: Helps correct AI's response
+    warp_factor = 1 + np.exp(-freqs[mask] / (cutoff_freq / 2))
+    
+    # Combined boost formula
+    boost_curve[mask] = base_boost * nonlinear_comp * warp_factor
+
+    # Additional enhancement for sub-bass frequencies (< cutoff_freq/4)
+    very_low_mask = freqs <= cutoff_freq / 4
+    boost_curve[very_low_mask] *= np.sqrt(cutoff_freq / (freqs[very_low_mask] + 1e-3))
+
+    # Apply boost curve
+    boosted_fft = fft_data * boost_curve
+    
+    # Convert back to time domain
+    boosted_audio = np.fft.irfft(boosted_fft, len(audio))
+    
+    # Soft normalization to prevent clipping while maintaining dynamics
+    peak = np.max(np.abs(boosted_audio))
+    if peak > 1.0:
+        boosted_audio /= peak * 1.05  # Slight reduction for headroom
+    
+    return boosted_audio
+
+
+# Improved Loss Function
+def improved_loss_function(original_audio, demodulated_audio, boosted_audio, fs):
+    # 1) Waveform similarity between demodulated boosted signal and original
+    waveform_mse = np.mean((original_audio - demodulated_audio) ** 2)
+    
+    # 2) Low frequency preservation with sufficient power
+    # Calculate power spectral density for both signals
+    f_orig, _, Sxx_orig = spectrogram(original_audio, fs)
+    f_demod, _, Sxx_demod = spectrogram(demodulated_audio, fs)
+    
+    # Find indices for low frequencies (< 300 Hz)
+    low_freq_idx = np.where(f_orig < 300)[0]
+    
+    # Calculate average power in low frequencies for both signals
+    low_freq_power_orig = np.mean(np.sum(Sxx_orig[low_freq_idx], axis=0))
+    low_freq_power_demod = np.mean(np.sum(Sxx_demod[low_freq_idx], axis=0))
+    
+    # Penalize if demodulated signal has less low-frequency power than original
+    low_freq_penalty = max(0, (low_freq_power_orig - low_freq_power_demod) / (low_freq_power_orig + 1e-10))
+    
+    # 3) Minimize distortions from air demodulation
+    # Calculate envelope smoothness (rapid changes indicate distortion)
+    demod_diff = np.diff(demodulated_audio)
+    distortion_penalty = np.mean(demod_diff**2)
+    
+    # Calculate harmonic distortion by comparing frequency content
+    _, _, Sxx_boosted = spectrogram(boosted_audio, fs)
+    min_time_bins = min(Sxx_demod.shape[1], Sxx_boosted.shape[1])
+    
+    # Compare frequency distributions, focusing on harmonics that shouldn't be there
+    freq_diff = np.mean((Sxx_demod[:, :min_time_bins] - Sxx_boosted[:, :min_time_bins])**2)
+    
+    # Weight the components (these weights can be tuned)
+    w1, w2, w3, w4 = 1.0, 1.2, 30, 1.0
+    
+    total_loss = w1 * waveform_mse + w2 * low_freq_penalty + w3 * distortion_penalty + w4 * freq_diff
+    
+    # Return both total loss and components for monitoring
+    loss_components = {
+        "waveform_mse": waveform_mse,
+        "low_freq_penalty": low_freq_penalty,
+        "distortion_penalty": distortion_penalty,
+        "freq_diff": freq_diff,
+        "total_loss": total_loss
+    }
+    
+    return total_loss, loss_components
+
+# RL Agent (Neural Network for Optimization)
+class BoostTuner(nn.Module):
+    def __init__(self):
+        super(BoostTuner, self).__init__()
+        self.fc1 = nn.Linear(3, 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 3)  # Output: boost_factor, cutoff, order
+    
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return torch.sigmoid(self.fc3(x)) * torch.tensor([4.0, 900, 9]) + torch.tensor([1.0, 100, 1])
+
+# Training Loop with Improved Loss Function
+def train_boost_tuner(original_audio, fs, epochs=50):
+    model = BoostTuner()
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
+    
+    # For tracking progress
+    loss_history = []
+    
+    for epoch in range(epochs):
+        params = model(torch.randn(1, 3))  # Sample random input
+        boost_factor, cutoff, order = params[0].detach().numpy()
+        
+        boosted_audio = advanced_low_freq_booster(original_audio, fs, boost_factor, cutoff, int(order))
+        modulated_audio = am_modulate(boosted_audio, fs)
+        demodulated_audio = air_demodulate(modulated_audio, fs)
+        
+        # Compute Loss using improved loss function
+        loss, loss_components = improved_loss_function(original_audio, demodulated_audio, boosted_audio, fs)
+        
+        # Convert loss to tensor for backpropagation
+        loss_tensor = torch.tensor(loss, requires_grad=True)
+        
+        # Optimize
+        optimizer.zero_grad()
+        loss_tensor.backward()
+        optimizer.step()
+        
+        loss_history.append(loss_components)
+
+        if epoch % 50 == 0:
+            print(f"Epoch {epoch}: Total Loss {loss:.4f}")
+            print(f"  Waveform MSE: {loss_components['waveform_mse']:.4f}")
+            print(f"  Low Freq Penalty: {loss_components['low_freq_penalty']:.4f}")
+            print(f"  Distortion Penalty: {loss_components['distortion_penalty']:.4f}")
+            print(f"  Frequency Diff: {loss_components['freq_diff']:.4f}")
+            print(f"  Params: {params.detach().numpy()}")
+
+    # Return both the model and loss history for analysis
+    return model, loss_history
+
+# Analyze and compare original and boosted signals
+def analyze_signals(original, boosted, demod_original, demod_boosted, fs, freqs=None):
+    if freqs is None:
+        freqs = np.arange(100, 1100, 100)
+    
+    # Create figure for time domain comparison
+    plt.figure(figsize=(15, 10))
+    
+    # Time domain plots
+    plt.subplot(4, 1, 1)
+    plt.plot(original, label="Original")
+    plt.title("Original Multi-Tone Signal")
+    plt.legend()
+    
+    plt.subplot(4, 1, 2)
+    plt.plot(boosted, label="Boosted", color='orange')
+    plt.title("Boosted Multi-Tone Signal")
+    plt.legend()
+    
+    plt.subplot(4, 1, 3)
+    plt.plot(demod_original, label="Demodulated Original")
+    plt.title("Air-Demodulated Original Signal")
+    plt.legend()
+    
+    plt.subplot(4, 1, 4)
+    plt.plot(demod_boosted, label="Demodulated Boosted", color='red')
+    plt.title("Air-Demodulated Boosted Signal")
+    plt.legend()
+    plt.tight_layout()
+    
+    # Spectrograms
+    plt.figure(figsize=(15, 12))
+    
+    plt.subplot(4, 1, 1)
+    f, t, Sxx = spectrogram(original, fs, nperseg=1024)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx+ 1e-8 ), shading='gouraud')
+    plt.ylabel('Frequency (Hz)')
+    plt.title('Spectrogram: Original Signal')
+    plt.colorbar(label='Power (dB)')
+    plt.ylim(0, 20000)  # Focus on audible range
+    
+    plt.subplot(4, 1, 2)
+    f, t, Sxx = spectrogram(boosted, fs, nperseg=1024)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx+ 1e-8 ), shading='gouraud')
+    plt.ylabel('Frequency (Hz)')
+    plt.title('Spectrogram: Boosted Signal')
+    plt.colorbar(label='Power (dB)')
+    plt.ylim(0, 20000)  # Focus on audible range
+    
+    plt.subplot(4, 1, 3)
+    f, t, Sxx = spectrogram(demod_original, fs, nperseg=4096)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-8), shading='gouraud')
+    plt.ylabel('Frequency (Hz)')
+    plt.title('Spectrogram: Demodulated Original Signal')
+    plt.colorbar(label='Power (dB)')
+    plt.ylim(0, 20000)  # Focus on audible range
+    
+    plt.subplot(4, 1, 4)
+    f, t, Sxx = spectrogram(demod_boosted, fs, nperseg=4096)
+    plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-8), shading='gouraud')
+    plt.ylabel('Frequency (Hz)')
+    plt.xlabel('Time (s)')
+    plt.title('Spectrogram: Demodulated Boosted Signal')
+    plt.colorbar(label='Power (dB)')
+    plt.ylim(0, 20000)  # Focus on audible range
+    plt.tight_layout()
+    
+    # Power Spectral Density comparison
+    plt.figure(figsize=(15, 10))
+    
+    # Calculate PSDs
+    frequencies_orig, psd_original = welch(original, fs, nperseg=4096)
+    frequencies_boost, psd_boosted = welch(boosted, fs, nperseg=4096)
+    frequencies_demod_orig, psd_demod_orig = welch(demod_original, fs, nperseg=4096)
+    frequencies_demod_boost, psd_demod_boost = welch(demod_boosted, fs, nperseg=4096)
+    
+    # Plot PSDs
+    plt.subplot(2, 1, 1)
+    plt.semilogy(frequencies_orig, psd_original, label="Original")
+    plt.semilogy(frequencies_boost, psd_boosted, label="Boosted", color='orange')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density')
+    plt.title("PSD: Original vs. Boosted Signals")
+    plt.legend()
+    plt.grid(True)
+    plt.xlim(0, 20000)  # Focus on audible range
+    
+    plt.subplot(2, 1, 2)
+    plt.semilogy(frequencies_demod_orig, psd_demod_orig, label="Demodulated Original")
+    plt.semilogy(frequencies_demod_boost, psd_demod_boost, label="Demodulated Boosted", color='red')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density')
+    plt.title("PSD: Demodulated Original vs. Demodulated Boosted")
+    plt.legend()
+    plt.grid(True)
+    plt.xlim(0, 20000)  # Focus on audible range
+    plt.tight_layout()
+    
+
+    # Frequency response analysis for specific test frequencies
+    plt.figure(figsize=(12, 6))
+    
+    # Extract amplitude at test frequencies
+    orig_response = []
+    boost_response = []
+    demod_orig_response = []
+    demod_boost_response = []
+    
+    # Create a small window around each test frequency
+    window_size = 20  # Hz
+    
+    for freq in freqs:
+        # Find indices in PSD arrays that correspond to this frequency ± window_size
+        orig_idx = np.where((frequencies_orig >= freq-window_size) & (frequencies_orig <= freq+window_size))
+        boost_idx = np.where((frequencies_boost >= freq-window_size) & (frequencies_boost <= freq+window_size))
+        demod_orig_idx = np.where((frequencies_demod_orig >= freq-window_size) & (frequencies_demod_orig <= freq+window_size))
+        demod_boost_idx = np.where((frequencies_demod_boost >= freq-window_size) & (frequencies_demod_boost <= freq+window_size))
+
+        
+        # Take max value in the window
+        orig_response.append(np.max(psd_original[orig_idx]) if len(orig_idx[0]) > 0 else 0)
+        boost_response.append(np.max(psd_boosted[boost_idx]) if len(boost_idx[0]) > 0 else 0)
+        demod_orig_response.append(np.max(psd_demod_orig[demod_orig_idx]) if len(demod_orig_idx[0]) > 0 else 0)
+        demod_boost_response.append(np.max(psd_demod_boost[demod_boost_idx]) if len(demod_boost_idx[0]) > 0 else 0)
+    
+    # Normalize for comparison
+    if max(orig_response) > 0:
+        orig_response = np.array(orig_response) / max(orig_response)
+    if max(boost_response) > 0:
+        boost_response = np.array(boost_response) / max(boost_response)
+    if max(demod_orig_response) > 0:
+        demod_orig_response = np.array(demod_orig_response) / max(demod_orig_response)
+    if max(demod_boost_response) > 0:
+        demod_boost_response = np.array(demod_boost_response) / max(demod_boost_response)
+    
+    # Plot relative frequency response
+    plt.plot(freqs, orig_response, 'o-', label="Original")
+    plt.plot(freqs, boost_response, 's-', label="Boosted")
+    plt.plot(freqs, demod_orig_response, 'x-', label="Demodulated Original")
+    plt.plot(freqs, demod_boost_response, 'd-', label="Demodulated Boosted")
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Normalized Amplitude')
+    plt.title('Frequency Response at Test Frequencies')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    
+    plt.show()
+    
+    return {
+        'original_response': orig_response,
+        'boosted_response': boost_response,
+        'demod_original_response': demod_orig_response, 
+        'demod_boosted_response': demod_boost_response
+    }
+
+
+import numpy as np
+import soundfile as sf
+import matplotlib.pyplot as plt
+from scipy.signal import spectrogram, welch
+from scipy.fftpack import fft
+
+def analyze_low_freq_and_thd(original_audio, boosted_audio, demod_original, demod_boosted, fs):
+    """
+    Comprehensive analysis of low frequency improvement and THD measurement for 
+    parametric audio signals before and after boosting.
+    
+    Parameters:
+    - original_audio: Original input audio signal
+    - boosted_audio: Audio signal after low frequency boosting
+    - demod_original: Demodulated signal without boosting
+    - demod_boosted: Demodulated signal with boosting applied
+    - fs: Sample rate in Hz
+    
+    Returns:
+    - Dictionary containing various metrics for low frequency improvement and distortion
+    """
+    import numpy as np
+    from scipy.signal import welch, spectrogram
+    import librosa
+    
+    # Define frequency bands for analysis
+    sub_bass = (20, 60)    # Sub-bass
+    bass = (60, 250)       # Bass
+    low_mid = (250, 500)   # Low midrange
+    
+    # 1. Power spectral density analysis
+    freq_orig, psd_orig = welch(original_audio, fs, nperseg=8192)
+    freq_boost, psd_boost = welch(boosted_audio, fs, nperseg=8192)
+    freq_demod_orig, psd_demod_orig = welch(demod_original, fs, nperseg=8192)
+    freq_demod_boost, psd_demod_boost = welch(demod_boosted, fs, nperseg=8192)
+    
+    # Helper function to calculate energy in specific frequency band
+    def band_energy(freqs, psd, band):
+        indices = np.where((freqs >= band[0]) & (freqs <= band[1]))
+        return np.sum(psd[indices])
+    
+    # 2. Calculate band energy for each signal
+    bands = {"sub_bass": sub_bass, "bass": bass, "low_mid": low_mid}
+    energy_metrics = {}
+    
+    for band_name, band_range in bands.items():
+        # Calculate energy in each band for each signal
+        orig_energy = band_energy(freq_orig, psd_orig, band_range)
+        boost_energy = band_energy(freq_boost, psd_boost, band_range)
+        demod_orig_energy = band_energy(freq_demod_orig, psd_demod_orig, band_range)
+        demod_boost_energy = band_energy(freq_demod_boost, psd_demod_boost, band_range)
+        
+        # Calculate improvement ratios
+        if orig_energy > 0:
+            pre_boost_ratio = boost_energy / orig_energy
+        else:
+            pre_boost_ratio = float('inf')
+            
+        if demod_orig_energy > 0:
+            post_demod_ratio = demod_boost_energy / demod_orig_energy
+        else:
+            post_demod_ratio = float('inf')
+        
+        # Store results
+        energy_metrics[band_name] = {
+            "original": orig_energy,
+            "boosted": boost_energy,
+            "demod_original": demod_orig_energy,
+            "demod_boosted": demod_boost_energy,
+            "pre_boost_ratio": pre_boost_ratio,
+            "post_demod_ratio": post_demod_ratio
+        }
+    
+    # 3. Calculate spectral centroid - lower value means more low frequency content
+    sc_orig = librosa.feature.spectral_centroid(y=original_audio, sr=fs)[0].mean()
+    sc_boost = librosa.feature.spectral_centroid(y=boosted_audio, sr=fs)[0].mean()
+    sc_demod_orig = librosa.feature.spectral_centroid(y=demod_original, sr=fs)[0].mean()
+    sc_demod_boost = librosa.feature.spectral_centroid(y=demod_boosted, sr=fs)[0].mean()
+    
+    # 4. Calculate spectral flatness - measure of how noise-like vs. tone-like the signal is
+    sf_orig = librosa.feature.spectral_flatness(y=original_audio)[0].mean()
+    sf_boost = librosa.feature.spectral_flatness(y=boosted_audio)[0].mean()
+    sf_demod_orig = librosa.feature.spectral_flatness(y=demod_original)[0].mean()
+    sf_demod_boost = librosa.feature.spectral_flatness(y=demod_boosted)[0].mean()
+    
+    # 5. Calculate low-frequency weighted SNR (focusd on bass frequencies)
+    def weighted_snr(signal, reference):
+        # Calculate error signal
+        error = signal - reference
+        
+        # Calculate weighted SNR focusing on low frequencies
+        f_signal, psd_signal = welch(signal, fs, nperseg=8192)
+        f_error, psd_error = welch(error, fs, nperseg=8192)
+        
+        # Apply bass weighting function (emphasis on < 500Hz)
+        weights = 1.0 / (1.0 + (f_signal / 500) ** 2)
+        
+        # Calculate weighted SNR
+        signal_power = np.sum(psd_signal * weights)
+        error_power = np.sum(psd_error * weights)
+        
+        if error_power > 0:
+            return 10 * np.log10(signal_power / error_power)
+        else:
+            return float('inf')
+    
+    snr_orig_to_demod_orig = weighted_snr(demod_original, original_audio)
+    snr_boost_to_demod_boost = weighted_snr(demod_boosted, original_audio)
+    
+    # 6. Calculate THD (Total Harmonic Distortion)
+    def calculate_thd(signal, fs, fundamental_freq=None):
+        # If fundamental frequency is not provided, estimate it
+        if fundamental_freq is None:
+            # Use simple FFT peak detection to find fundamental
+            n = len(signal)
+            fft_data = np.abs(np.fft.rfft(signal * np.hanning(n)))
+            freqs = np.fft.rfftfreq(n, 1/fs)
+            
+            # Find peak in 50-500 Hz range as likely fundamental
+            mask = (freqs >= 50) & (freqs <= 500)
+            if np.any(mask):
+                peak_idx = np.argmax(fft_data[mask]) + np.where(mask)[0][0]
+                fundamental_freq = freqs[peak_idx]
+            else:
+                # Default to 100 Hz if no clear peak
+                fundamental_freq = 100
+        
+        # Calculate FFT
+        n = len(signal)
+        window = np.hanning(n)
+        fft_data = np.abs(np.fft.rfft(signal * window))
+        freqs = np.fft.rfftfreq(n, 1/fs)
+        
+        # Identify fundamental and harmonics
+        tolerance = 5  # Hz
+        fundamental_idx = np.where(np.abs(freqs - fundamental_freq) < tolerance)[0]
+        fundamental_power = np.sum(fft_data[fundamental_idx] ** 2) if len(fundamental_idx) > 0 else 0
+        
+        # Calculate power in the first 10 harmonics
+        harmonic_power = 0
+        for i in range(2, 11):  # 2nd to 10th harmonics
+            harmonic_freq = fundamental_freq * i
+            if harmonic_freq < fs/2:  # Only if below Nyquist
+                harmonic_idx = np.where(np.abs(freqs - harmonic_freq) < tolerance)[0]
+                harmonic_power += np.sum(fft_data[harmonic_idx] ** 2) if len(harmonic_idx) > 0 else 0
+        
+        # Calculate THD
+        if fundamental_power > 0:
+            thd = np.sqrt(harmonic_power / fundamental_power)
+            thd_db = 20 * np.log10(thd)
+            thd_percent = thd * 100
+        else:
+            thd = float('inf')
+            thd_db = float('inf')
+            thd_percent = float('inf')
+        
+        return {
+            "thd_ratio": thd,
+            "thd_db": thd_db,
+            "thd_percent": thd_percent,
+            "fundamental_freq": fundamental_freq
+        }
+    
+    # Calculate THD for demodulated signals
+    # First, estimate fundamental frequency from original
+    n = len(original_audio)
+    fft_data = np.abs(np.fft.rfft(original_audio * np.hanning(n)))
+    freqs = np.fft.rfftfreq(n, 1/fs)
+    mask = (freqs >= 50) & (freqs <= 500)
+    if np.any(mask):
+        peak_idx = np.argmax(fft_data[mask]) + np.where(mask)[0][0]
+        fundamental_freq = freqs[peak_idx]
+    else:
+        fundamental_freq = 100
+    
+    thd_demod_orig = calculate_thd(demod_original, fs, fundamental_freq)
+    thd_demod_boost = calculate_thd(demod_boosted, fs, fundamental_freq)
+    
+    # 7. Calculate normalized cross-correlation between original and demodulated signals
+    def normalized_xcorr_max(x, y):
+        """Calculate maximum of normalized cross-correlation between two signals"""
+        correlation = np.correlate(x / np.sqrt(np.sum(x**2)), y / np.sqrt(np.sum(y**2)), 'full')
+        return np.max(correlation)
+    
+    xcorr_orig_demod_orig = normalized_xcorr_max(original_audio, demod_original)
+    xcorr_orig_demod_boost = normalized_xcorr_max(original_audio, demod_boosted)
+    
+    # 8. Calculate PEAQ-inspired metrics (Perceptual Evaluation of Audio Quality)
+    # Modified simple version focusing on low frequency perception
+    def calculate_peaq_metrics(reference, test, fs):
+        # Get spectrograms
+        _, _, Sxx_ref = spectrogram(reference, fs, nperseg=2048)
+        _, _, Sxx_test = spectrogram(test, fs, nperseg=2048)
+        
+        # Log spectra
+        log_spec_ref = 10 * np.log10(Sxx_ref + 1e-10)
+        log_spec_test = 10 * np.log10(Sxx_test + 1e-10)
+        
+        # Calculate differences
+        diff = log_spec_test - log_spec_ref
+        
+        # Calculate average difference, focusing on low frequencies
+        # Use first 20% of frequency bins (approximately covering 0-2kHz)
+        low_freq_bins = int(Sxx_ref.shape[0] * 0.2)
+        avg_diff = np.mean(diff[:low_freq_bins, :])
+        
+        # Noise to mask ratio - measure of audible difference
+        nmr = np.mean(np.abs(diff[:low_freq_bins, :]))
+        
+        return {
+            "avg_spectral_diff": avg_diff,
+            "noise_to_mask_ratio": nmr
+        }
+    
+    peaq_metrics_orig = calculate_peaq_metrics(original_audio, demod_original, fs)
+    peaq_metrics_boost = calculate_peaq_metrics(original_audio, demod_boosted, fs)
+    
+    # Compile all results
+    results = {
+        "energy_metrics": energy_metrics,
+        "spectral_centroid": {
+            "original": sc_orig,
+            "boosted": sc_boost,
+            "demod_original": sc_demod_orig,
+            "demod_boosted": sc_demod_boost,
+            "improvement_ratio": sc_demod_orig / sc_demod_boost if sc_demod_boost > 0 else float('inf')
+        },
+        "spectral_flatness": {
+            "original": sf_orig,
+            "boosted": sf_boost,
+            "demod_original": sf_demod_orig,
+            "demod_boosted": sf_demod_boost,
+            "ratio": sf_demod_boost / sf_demod_orig if sf_demod_orig > 0 else float('inf')
+        },
+        "weighted_snr": {
+            "original_to_demod_original": snr_orig_to_demod_orig,
+            "original_to_demod_boosted": snr_boost_to_demod_boost,
+            "improvement_db": snr_boost_to_demod_boost - snr_orig_to_demod_orig
+        },
+        "thd": {
+            "demod_original": thd_demod_orig,
+            "demod_boosted": thd_demod_boost,
+            "improvement_ratio": thd_demod_orig["thd_ratio"] / thd_demod_boost["thd_ratio"] 
+                if thd_demod_boost["thd_ratio"] > 0 else float('inf')
+        },
+        "normalized_xcorr": {
+            "original_to_demod_original": xcorr_orig_demod_orig,
+            "original_to_demod_boosted": xcorr_orig_demod_boost,
+            "improvement_ratio": xcorr_orig_demod_boost / xcorr_orig_demod_orig 
+                if xcorr_orig_demod_orig > 0 else float('inf')
+        },
+        "peaq_metrics": {
+            "original": peaq_metrics_orig,
+            "boosted": peaq_metrics_boost
+        }
+    }
+    
+    # Print summary
+    print("=== Low Frequency Analysis Summary ===")
+    print(f"Sub-bass improvement ratio: {energy_metrics['sub_bass']['post_demod_ratio']:.2f}x")
+    print(f"Bass improvement ratio: {energy_metrics['bass']['post_demod_ratio']:.2f}x")
+    print(f"Low-mid improvement ratio: {energy_metrics['low_mid']['post_demod_ratio']:.2f}x")
+    print(f"THD original: {thd_demod_orig['thd_percent']:.2f}%")
+    print(f"THD boosted: {thd_demod_boost['thd_percent']:.2f}%")
+    print(f"Signal correlation improvement: {results['normalized_xcorr']['improvement_ratio']:.2f}x")
+    print(f"Weighted SNR improvement: {results['weighted_snr']['improvement_db']:.2f} dB")
+    
+    return results
+
+
+import librosa
+
+import resampy
+from scipy.signal import butter, sosfilt
+import numpy as np
+
+def lowpass_filter(audio, fs, cutoff=20000, order=8):
+    sos = butter(order, cutoff, btype='lowpass', fs=fs, output='sos')
+    return sosfilt(sos, audio)
+
+def handle_resampling(audio, orig_fs, target_fs):
+    # Step 1: Low-pass filter to avoid aliasing above Nyquist of original
+    print(f"Applying low-pass filter at 20kHz to avoid aliasing...")
+    audio = lowpass_filter(audio, orig_fs, cutoff=20000)
+
+    # Step 2: High-quality resampling using resampy (sinc-based)
+    print(f"Resampling from {orig_fs}Hz to {target_fs}Hz")
+    audio_resampled = resampy.resample(audio, sr_orig=orig_fs, sr_new=target_fs)
+    
+    return audio_resampled
+
+"""
+
+Load a WAV file, process it, and save the results.
+"""
+# Define file paths
+
+!pip show resampy
+#Testing model with 0.2 transformer model v with custom loss for demod
+
+test_frequencies = np.arange(100, 1100, 100)
+multi_tone_signal = generate_multi_tone_signal(fs, test_frequencies)
+original_audio = multi_tone_signal
+
+
+
+
+
+
+
+
+print("Training boost parameters...")
+trained_model, loss_history = train_boost_tuner(original_audio, fs)
+
+# Apply Optimized Boosting
+optimal_params = trained_model(torch.randn(1, 3))[0].detach().numpy()
+boost_factor, cutoff, order = optimal_params
+print(f"Optimal parameters: boost_factor={boost_factor:.2f}, cutoff={cutoff:.1f}Hz, order={int(order)}")
+
+# Process original audio (normal approach)
+modulated_audio_normal = am_modulate(original_audio, fs)
+demodulated_audio_normal = air_demodulate(modulated_audio_normal, fs)
+
+# Process with boosting before modulation
+boosted_audio = advanced_low_freq_booster(original_audio, fs, boost_factor, cutoff, int(order))
+modulated_audio_boosted = am_modulate(boosted_audio, fs)
+demodulated_audio_boosted = air_demodulate(modulated_audio_boosted, fs)
+
+# Compute Final Performance
+final_loss, final_components = improved_loss_function(original_audio, demodulated_audio_boosted, boosted_audio, fs)
+print("\nFinal Performance:")
+print(f"Total Loss: {final_loss:.4f}")
+print(f"Waveform MSE: {final_components['waveform_mse']:.4f}")
+print(f"Low Freq Penalty: {final_components['low_freq_penalty']:.4f}")
+print(f"Distortion Penalty: {final_components['distortion_penalty']:.4f}")
+print(f"Frequency Diff: {final_components['freq_diff']:.4f}")
+
+
+
+
+
+
+
+
+
+
+
+def extreme_bass_booster(audio, fs, boost_factor=7.0, cutoff_freq=20000):
+    """
+    Extreme bass booster that ONLY affects frequencies below cutoff, preserves everything else.
+    Enhanced for parametric acoustic systems with 20kHz cutoff to prevent harmonic distortions.
+    """
+    
+    audio = np.asarray(audio, dtype=np.float64)
+    original_length = len(audio)
+    
+    fft_data = np.fft.rfft(audio)
+    freqs = np.fft.rfftfreq(original_length, 1/fs)
+    
+    # Initialize boost curve to exactly 1.0 (no change)
+    boost_curve = np.ones_like(freqs, dtype=np.float64)
+    
+    # ONLY boost frequencies below cutoff - everything else stays at 1.0
+    mask = freqs < cutoff_freq  # Changed <= to < for stricter cutoff
+    
+    if np.any(mask):
+        # NARROWER TRANSITION ZONE - but wider for 20kHz cutoff
+        transition_width = 200  # Hz - increased for higher cutoff frequency
+        
+        # Define regions with more aggressive low-end targeting
+        boost_region_mask = mask & (freqs <= (cutoff_freq - transition_width))
+        boost_freqs = freqs[boost_region_mask]
+        
+        # EXTREMELY AGGRESSIVE low frequency correction
+        if np.any(boost_region_mask):
+            freq_ratio = (cutoff_freq - boost_freqs) / cutoff_freq
+            
+            # MUCH MORE aggressive base boost - exponential scaling
+            base_boost = boost_factor * (5 + 6 * np.log1p(freq_ratio * 3 + 3))
+            
+            # Super strong nonlinear compensation - higher exponent
+            nonlinear_comp = np.power(cutoff_freq / (boost_freqs + 0.01), 1.2)
+            
+            # Very strong warping - more aggressive curve
+            warp_factor = 1 + 5 * np.exp(-boost_freqs / (cutoff_freq / 2))
+            
+            # Enhanced psychoacoustic boost - stronger for sub-audible
+            psycho_boost = 1 + 6 * np.exp(-boost_freqs / 35)
+            
+            # MULTIPLY ALL - extreme aggression
+            boost_values = base_boost * nonlinear_comp * warp_factor * psycho_boost
+            
+            # Different tiers of sub-bass boosting
+            # Ultra-low (0-30Hz) - MAXIMUM boost
+            ultra_low_mask = boost_freqs <= 30
+            if np.any(ultra_low_mask):
+                boost_values[ultra_low_mask] *= 8.0
+            
+            # Sub-bass (30-80Hz) - Very high boost  
+            sub_bass_mask = (boost_freqs > 30) & (boost_freqs <= 80)
+            if np.any(sub_bass_mask):
+                boost_values[sub_bass_mask] *= 5.0
+                
+            # Low bass (80-150Hz) - High boost
+            low_bass_mask = (boost_freqs > 80) & (boost_freqs <= 150)
+            if np.any(low_bass_mask):
+                boost_values[low_bass_mask] *= 3.5
+            
+            # Mid-bass (150-cutoff-transition) - Moderate boost
+            mid_bass_mask = boost_freqs > 150
+            if np.any(mid_bass_mask):
+                boost_values[mid_bass_mask] *= 2.5
+            
+            # Apply the extreme boost
+            boost_curve[boost_region_mask] = boost_values
+        
+        # SMOOTH TRANSITION using raised cosine - fix harmonic distortion
+        transition_region_mask = mask & (freqs > (cutoff_freq - transition_width))
+        transition_freqs = freqs[transition_region_mask]
+        
+        if np.any(transition_region_mask):
+            # Get the boost value at start of transition
+            transition_start_freq = cutoff_freq - transition_width
+            
+            # Find closest frequency bin to transition start
+            start_idx = np.argmin(np.abs(freqs - transition_start_freq))
+            start_boost_value = boost_curve[start_idx] if start_idx < len(boost_curve) else boost_factor
+            
+            # Raised cosine transition (eliminates Gibbs phenomenon)
+            transition_progress = (transition_freqs - transition_start_freq) / transition_width
+            transition_progress = np.clip(transition_progress, 0, 1)
+            
+            # Smooth cosine window
+            cosine_window = 0.5 * (1 + np.cos(np.pi * transition_progress))
+            
+            # Smooth interpolation from start_boost_value to 1.0
+            transition_values = 1.0 + cosine_window * (start_boost_value - 1.0)
+            
+            # Apply transition values
+            boost_curve[transition_region_mask] = transition_values
+    
+    # Ensure frequencies above cutoff are EXACTLY 1.0 (unchanged)
+    high_freq_mask = freqs > cutoff_freq
+    boost_curve[high_freq_mask] = 1.0
+    
+    # Apply boost
+    boosted_fft = fft_data * boost_curve
+    boosted_audio = np.fft.irfft(boosted_fft, n=original_length)
+    
+    # Preserve overall energy and prevent waveform distortion (ORIGINAL METHOD)
+    original_rms = np.sqrt(np.mean(audio ** 2))
+    boosted_rms = np.sqrt(np.mean(boosted_audio ** 2))
+    
+    if boosted_rms > 0 and original_rms > 0:
+        # Maintain similar RMS energy to preserve waveform characteristics
+        energy_ratio = original_rms / boosted_rms
+        # Apply compensation but limit to prevent over-boosting
+        compensation = np.clip(energy_ratio * 1.2, 0.5, 2.0)
+        boosted_audio *= compensation
+    
+    # Gentle peak limiting to preserve waveform shape (ORIGINAL METHOD)
+    peak = np.max(np.abs(boosted_audio))
+    if peak > 0.9:
+        # Use soft tanh limiting instead of hard clipping
+        boosted_audio = np.tanh(boosted_audio / peak * 0.9) * 0.95
+    
+    return boosted_audio, boost_curve
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+input_file = "/kaggle/input/environmental-sound-classification-50/audio/audio/44100/1-115920-A-22.wav"
+output_dir = "output"
+
+# Create output directory if it doesn't exist
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Load WAV file
+print(f"Loading input file: {input_file}")
+try:
+    original_audio, file_fs = sf.read(input_file)
+except Exception as e:
+    print(f"Error loading file: {e}")
+    
+
+
+# Check if the audio has multiple channels (stereo) and convert to mono if needed
+if len(original_audio.shape) > 1 and original_audio.shape[1] > 1:
+    print("Converting stereo to mono by averaging channels")
+    original_audio = np.mean(original_audio, axis=1)
+
+# Normalize audio
+original_audio = original_audio / np.max(np.abs(original_audio))
+
+# Resample if necessary (if file's sample rate differs from our processing fs)
+if file_fs != fs:
+
+    
+    #print(f"Resampling from {file_fs}Hz to {fs}Hz")
+    #duration = len(original_audio) / file_fs
+    #time_old = np.linspace(0, duration, len(original_audio))
+    #time_new = np.linspace(0, duration, int(duration * fs))
+    original_audio = handle_resampling(original_audio, file_fs,fs)
+
+#original_audio = original_audio / np.max(np.abs(original_audio))
+
+print("Training boost parameters...")
+trained_model, loss_history = train_boost_tuner(original_audio, fs)
+
+# Apply Optimized Boosting
+optimal_params = trained_model(torch.randn(1, 3))[0].detach().numpy()
+boost_factor, cutoff, order = optimal_params
+print(f"Optimal parameters: boost_factor={boost_factor:.2f}, cutoff={cutoff:.1f}Hz, order={int(order)}")
+
+# Process original audio (normal approach)
+modulated_audio_normal = am_modulate(original_audio, fs)
+demodulated_audio_normal = air_demodulate(modulated_audio_normal, fs)
+
+# Process with boosting before modulation
+boosted_audio = advanced_low_freq_booster(original_audio, fs, boost_factor, cutoff, int(order))
+modulated_audio_boosted = am_modulate(boosted_audio, fs)
+demodulated_audio_boosted = air_demodulate(modulated_audio_boosted, fs)
+
+# Compute Final Performance
+final_loss, final_components = improved_loss_function(original_audio, demodulated_audio_boosted, boosted_audio, fs)
+print("\nFinal Performance:")
+print(f"Total Loss: {final_loss:.4f}")
+print(f"Waveform MSE: {final_components['waveform_mse']:.4f}")
+print(f"Low Freq Penalty: {final_components['low_freq_penalty']:.4f}")
+print(f"Distortion Penalty: {final_components['distortion_penalty']:.4f}")
+print(f"Frequency Diff: {final_components['freq_diff']:.4f}")
+
+# Run signal analysis
+analysis = analyze_signals(
+    original_audio,
+    boosted_audio,
+    demodulated_audio_normal,
+    demodulated_audio_boosted,
+    fs
+)
+
+
+
+
+extreme_audio, extreme_curve = extreme_bass_booster(
+    original_audio, fs,
+    boost_factor=7,   # VERY high bass boost
+    cutoff_freq=5000     # STRICT cutoff - nothing above this gets touched
+)
+
+
+# modulated_audio_boosted = am_modulate(boosted_audio, fs)
+# demodulated_audio_boosted = air_demodulate(modulated_audio_boosted, fs)
+
+
+# analysis = analyze_signals(
+#     original_audio,
+#     boosted_audio,
+#     demodulated_audio_normal,
+#     demodulated_audio_boosted,
+#     fs
+# )
+
+
+modulated_audio_boosted = am_modulate(extreme_audio, fs)
+demodulated_audio_boosted = air_demodulate(modulated_audio_boosted, fs)
+
+
+analysis = analyze_signals(
+    original_audio,
+    extreme_audio,
+    demodulated_audio_normal,
+    demodulated_audio_boosted,
+    fs
+)
+
+
+
+
+
+
+
+
+
+
+
+
+# Save results
+print("Saving output files...")
+
+# Original audio
+sf.write(os.path.join(output_dir, "original.wav"), original_audio, fs)
+
+# Normal modulation/demodulation chain
+sf.write(os.path.join(output_dir, "modulated_normal.wav"), modulated_audio_normal, fs)
+sf.write(os.path.join(output_dir, "demodulated_normal.wav"), demodulated_audio_normal, fs)
+
+# Boosted modulation/demodulation chain
+sf.write(os.path.join(output_dir, "boosted.wav"), boosted_audio, fs)
+sf.write(os.path.join(output_dir, "modulated_boosted.wav"), modulated_audio_boosted, fs)
+sf.write(os.path.join(output_dir, "demodulated_boosted.wav"), demodulated_audio_boosted, fs)
+
+print(f"Processing complete. Output files saved to {output_dir}/")
+
+
+
+
+
+
+
