@@ -1,129 +1,127 @@
-# dashboard.py
-
 import streamlit as st
 import sqlite3
 import pandas as pd
-from datetime import datetime
+import numpy as np
+import time
 
-DB_FILE = "monitoring.db"
-
-# Page config
-st.set_page_config(page_title="Advanced System Monitor", layout="wide")
-st.title("🖥️ Advanced System Monitoring Dashboard")
+DB_FILE = "system_monitor.db"
+REFRESH_INTERVAL = 10  # seconds
 
 def load_data():
+    conn = sqlite3.connect(DB_FILE)
     try:
-        conn = sqlite3.connect(DB_FILE)
-        df_sys = pd.read_sql_query("SELECT * FROM system_metrics ORDER BY timestamp DESC", conn)
-        df_proc = pd.read_sql_query("SELECT * FROM process_metrics ORDER BY timestamp DESC", conn)
-        df_core = pd.read_sql_query("SELECT * FROM cpu_core_stats ORDER BY timestamp DESC", conn)
-        conn.close()
-        return df_sys, df_proc, df_core
+        system_df = pd.read_sql_query("SELECT * FROM system_metrics ORDER BY timestamp DESC LIMIT 100", conn)
+        process_df = pd.read_sql_query("SELECT * FROM process_metrics ORDER BY timestamp DESC LIMIT 500", conn)
+        core_df = pd.read_sql_query("SELECT * FROM cpu_core_stats ORDER BY timestamp DESC LIMIT 500", conn)
+        sched_df = pd.read_sql_query("SELECT * FROM scheduler_stats ORDER BY timestamp DESC LIMIT 500", conn)
     except Exception as e:
-        st.error(f"Database read failed: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        st.error(f"Error reading DB: {e}")
+        return None, None, None, None
+    finally:
+        conn.close()
+    return system_df, core_df, process_df, sched_df
 
-df_sys, df_proc, df_core = load_data()
+def compute_statistics(system_df, process_df, sched_df):
+    stats = {}
 
-if df_sys.empty:
-    st.warning("No system data available yet.")
-    st.stop()
+    # System-level
+    stats["Avg CPU %"] = round(system_df["cpu_percent"].mean(), 2)
+    stats["Max CPU %"] = round(system_df["cpu_percent"].max(), 2)
+    stats["Avg Mem %"] = round(system_df["memory_percent"].mean(), 2)
+    stats["Total Context Switches"] = int(system_df["context_switches"].sum())
 
-latest_sys = df_sys.iloc[0]
+    # Process-level
+    if process_df is not None and not process_df.empty:
+        # Use create_time or fallback to zero
+        process_df["create_time"] = process_df.get("create_time", 0)
+        uptime = (time.time() - process_df["create_time"]).clip(lower=1)
+        process_df["efficiency"] = process_df["cpu_time"] / uptime
+        stats["Avg Process Efficiency"] = round(process_df["efficiency"].mean(), 3)
+        stats["Avg CPU Time (s)"] = round(process_df["cpu_time"].mean(), 2)
+        stats["Max CPU Time (s)"] = round(process_df["cpu_time"].max(), 2)
+        stats["Total Context Switches (Processes)"] = int(process_df["ctx_switches"].sum())
+    else:
+        stats["Avg Process Efficiency"] = "N/A"
+        stats["Avg CPU Time (s)"] = "N/A"
+        stats["Max CPU Time (s)"] = "N/A"
+        stats["Total Context Switches (Processes)"] = "N/A"
 
-# Display overall system stats
-st.header("📊 System Summary")
+    # Scheduler-level
+    if sched_df is not None and not sched_df.empty:
+        stats["Avg Run Queue Length"] = round(sched_df["run_queue_length"].mean(), 2)
+        stats["Max Run Queue Length"] = int(sched_df["run_queue_length"].max())
+        stats["Avg Run Time (ms)"] = round(sched_df["run_time_ns"].mean() / 1e6, 2)
+    else:
+        stats["Avg Run Queue Length"] = "N/A"
+        stats["Max Run Queue Length"] = "N/A"
+        stats["Avg Run Time (ms)"] = "N/A"
 
-col1, col2, col3 = st.columns(3)
-col1.metric("CPU Usage (%)", f"{latest_sys['cpu_percent']:.2f}")
-col2.metric("Memory Usage (%)", f"{latest_sys['memory_percent']:.2f}")
-col3.metric("Context Switches", f"{int(latest_sys['context_switches'])}")
+    return stats
 
-col4, col5, col6 = st.columns(3)
-col4.metric("Running Processes", f"{int(latest_sys['processes_running'])}")
-col5.metric("Sleeping Processes", f"{int(latest_sys['processes_sleeping'])}")
-col6.metric("Load Avg (1 min)", f"{latest_sys['load_avg_1']:.2f}")
+def draw_dashboard():
+    st.title("📊 Real-time System Monitoring Dashboard")
 
-st.markdown("---")
+    try:
+        system_df, core_df, process_df, sched_df = load_data()
+        if system_df is None:
+            st.warning("Waiting for system metrics data...")
+            return
 
-# Per-core CPU usage
-st.header("⚙️ Per-CPU Core Usage")
-if not df_core.empty:
-    df_latest_core = df_core[df_core['timestamp'] == latest_sys['timestamp']]
-    df_latest_core = df_latest_core.sort_values('core')
-    st.bar_chart(data=df_latest_core.set_index('core')['cpu_percent'], width=700, height=200)
-else:
-    st.info("No CPU core data available.")
+        stats = compute_statistics(system_df, process_df, sched_df)
 
-st.markdown("---")
+        st.subheader("📌 System Summary")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Avg CPU %", stats["Avg CPU %"])
+        col1.metric("Max CPU %", stats["Max CPU %"])
+        col2.metric("Avg Mem %", stats["Avg Mem %"])
+        col2.metric("Total Context Switches", stats["Total Context Switches"])
+        col3.metric("Avg Run Queue Length", stats.get("Avg Run Queue Length", "N/A"))
+        col3.metric("Max Run Queue Length", stats.get("Max Run Queue Length", "N/A"))
 
-# Process Stats Table
-st.header("🧩 Per-Process Statistics (Live Processes)")
+        st.subheader("🧠 CPU Core Usage")
+        if core_df is not None and not core_df.empty:
+            # Show latest per-core CPU %
+            latest_core = core_df.groupby("core").first().reset_index()
+            st.bar_chart(latest_core.set_index("core")["cpu_percent"])
+        else:
+            st.info("No CPU core data available.")
 
-if df_proc.empty:
-    st.info("No process data available yet.")
-else:
-    # Filter latest timestamp
-    df_proc_latest = df_proc[df_proc['timestamp'] == latest_sys['timestamp']].copy()
+        st.subheader("⚙️ Per-Process Statistics (Active)")
+        if process_df is not None and not process_df.empty:
+            # Filter active processes (status not zombie)
+            active_procs = process_df[process_df["status"] != "zombie"].copy()
+            st.dataframe(
+                active_procs[["pid", "name", "user", "status", "cpu_time", "ctx_switches"]]
+                .sort_values(by="cpu_time", ascending=False),
+                use_container_width=True
+            )
+        else:
+            st.info("No process data available.")
 
-    # Calculate extra stats:
-    # Turnaround time = current_time - create_time
-    now_ts = datetime.fromisoformat(latest_sys['timestamp'])
-    df_proc_latest['turnaround_sec'] = df_proc_latest['create_time'].apply(lambda ct: (now_ts.timestamp() - ct) if ct else 0)
+        st.subheader("🧮 Scheduler Stats (Recent)")
+        if sched_df is not None and not sched_df.empty:
+            sched_display = sched_df[["timestamp", "cpu", "run_queue_length", "context_switches", "run_time_ns"]].copy()
+            sched_display["run_time_ms"] = sched_display["run_time_ns"] / 1e6
+            st.dataframe(sched_display, use_container_width=True)
+        else:
+            st.info("No scheduler stats available.")
 
-    # Efficiency = cpu_time / turnaround_time (bounded 0..1)
-    df_proc_latest['efficiency'] = df_proc_latest.apply(
-        lambda r: (r['cpu_time'] / r['turnaround_sec']) if r['turnaround_sec'] > 0 else 0, axis=1)
+        st.subheader("📈 Historical CPU/Memory Usage")
+        system_df_sorted = system_df.sort_values("timestamp")
+        st.line_chart(system_df_sorted[["cpu_percent", "memory_percent"]].reset_index(drop=True))
 
-    # Idle time approx = turnaround_sec - cpu_time
-    df_proc_latest['idle_time_sec'] = df_proc_latest['turnaround_sec'] - df_proc_latest['cpu_time']
+        st.subheader("📋 Detailed Metrics Summary")
+        for k, v in stats.items():
+            st.markdown(f"**{k}**: `{v}`")
 
-    # Sort by cpu_time desc
-    df_proc_latest = df_proc_latest.sort_values('cpu_time', ascending=False)
+        st.info(f"Dashboard updates every {REFRESH_INTERVAL} seconds. Scroll down for more tables.")
 
-    # Select columns and format nicely
-    df_display = df_proc_latest[[
-        'pid', 'name', 'user', 'status', 'cpu_time', 'ctx_switches',
-        'turnaround_sec', 'idle_time_sec', 'efficiency'
-    ]].copy()
+    except Exception as e:
+        st.error(f"Dashboard error: {e}")
 
-    df_display.columns = [
-        "PID", "Name", "User", "Status", "CPU Time (s)", "Context Switches",
-        "Turnaround Time (s)", "Idle Time (s)", "Efficiency (CPU/Turnaround)"
-    ]
+    # Auto refresh
+    time.sleep(REFRESH_INTERVAL)
+    st.experimental_rerun()
 
-    st.dataframe(df_display.style.format({
-        "CPU Time (s)": "{:.2f}",
-        "Turnaround Time (s)": "{:.1f}",
-        "Idle Time (s)": "{:.1f}",
-        "Efficiency (CPU/Turnaround)": "{:.2%}"
-    }), height=400)
-
-st.markdown("---")
-
-# System metrics trends charts
-st.header("📈 System Metrics Over Time (Last 500 samples)")
-
-# Prepare time index
-df_sys['timestamp'] = pd.to_datetime(df_sys['timestamp'])
-df_sys.set_index('timestamp', inplace=True)
-
-cols_to_plot = ['cpu_percent', 'memory_percent', 'context_switches', 'processes_running', 'processes_sleeping']
-
-st.line_chart(df_sys[cols_to_plot])
-
-st.markdown("---")
-
-# Advanced stats summary for system metrics
-st.header("📊 Advanced System Statistics")
-
-def stat_summary(col):
-    return {
-        "Min": df_sys[col].min(),
-        "Max": df_sys[col].max(),
-        "Average": df_sys[col].mean()
-    }
-
-stats = {col: stat_summary(col) for col in cols_to_plot}
-stats_df = pd.DataFrame(stats).T
-st.table(stats
+if __name__ == "__main__":
+    draw_dashboard()
