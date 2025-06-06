@@ -3,50 +3,51 @@ import time
 import psutil
 from datetime import datetime
 import os
-import traceback
+import subprocess
+import threading
 
 DB_FILE = "system_monitor.db"
 MAX_RECORDS = 500
-SLEEP_INTERVAL = 10  # seconds
+SLEEP_INTERVAL = 10
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
 
-        # Create system metrics table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_metrics (
             timestamp TEXT, cpu_percent REAL, memory_percent REAL,
             context_switches INTEGER, processes_running INTEGER,
             processes_sleeping INTEGER, load_avg_1 REAL,
             load_avg_5 REAL, load_avg_15 REAL
-        )
-        """)
+        )""")
 
-        # Create per-process stats table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS process_metrics (
             timestamp TEXT, pid INTEGER, name TEXT, user TEXT,
             cpu_time REAL, create_time REAL, ctx_switches INTEGER,
             status TEXT
-        )
-        """)
+        )""")
 
-        # Create per-core stats table
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS cpu_core_stats (
             timestamp TEXT, core INTEGER, cpu_percent REAL
-        )
-        """)
+        )""")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scheduler_stats (
+            timestamp TEXT, cpu INTEGER, run_queue_length INTEGER,
+            context_switches INTEGER, run_time_ns INTEGER
+        )""")
 
         conn.commit()
 
-def limit_table_rows(conn, table_name, max_rows=MAX_RECORDS):
+def limit_table_rows(conn, table_name):
     cursor = conn.cursor()
     cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
     count = cursor.fetchone()[0]
-    if count > max_rows:
-        to_delete = count - max_rows
+    if count > MAX_RECORDS:
+        to_delete = count - MAX_RECORDS
         cursor.execute(f"""
             DELETE FROM {table_name}
             WHERE rowid IN (
@@ -56,8 +57,31 @@ def limit_table_rows(conn, table_name, max_rows=MAX_RECORDS):
         """, (to_delete,))
         conn.commit()
 
+def collect_proc_schedstat(timestamp):
+    stats = []
+    with open("/proc/schedstat", "r") as f:
+        for idx, line in enumerate(f):
+            if line.startswith("cpu") and not line.startswith("cpu "):
+                parts = line.split()
+                cpu = idx - 1
+                run_time_ns = int(parts[1])
+                context_switches = int(parts[2])
+                run_queue_length = int(parts[3])
+                stats.append((timestamp, cpu, run_queue_length, context_switches, run_time_ns))
+    return stats
+
+def start_bpftrace_logger():
+    # Run this in a thread once to avoid blocking
+    script = """
+tracepoint:sched:sched_switch {
+    @ctx_switches[pid] = count();
+}
+"""
+    subprocess.Popen(["bpftrace", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 def collect_metrics():
     init_db()
+    threading.Thread(target=start_bpftrace_logger, daemon=True).start()
 
     while True:
         timestamp = datetime.utcnow().isoformat()
@@ -74,7 +98,6 @@ def collect_metrics():
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
 
-                # Insert system metrics
                 cursor.execute("""
                 INSERT INTO system_metrics
                 (timestamp, cpu_percent, memory_percent, context_switches,
@@ -87,7 +110,6 @@ def collect_metrics():
                     load_avg[0], load_avg[1], load_avg[2]
                 ))
 
-                # Insert process metrics
                 for proc in processes:
                     try:
                         cpu_time = sum(proc.info['cpu_times']) if proc.info['cpu_times'] else 0.0
@@ -107,10 +129,8 @@ def collect_metrics():
                             proc.info['status']
                         ))
                     except Exception:
-                        # Skip any process we can't access
                         continue
 
-                # Insert CPU core stats
                 per_core_usage = psutil.cpu_percent(interval=None, percpu=True)
                 for core, usage in enumerate(per_core_usage):
                     cursor.execute("""
@@ -118,16 +138,22 @@ def collect_metrics():
                     VALUES (?, ?, ?)
                     """, (timestamp, core, usage))
 
+                schedstats = collect_proc_schedstat(timestamp)
+                for row in schedstats:
+                    cursor.execute("""
+                    INSERT INTO scheduler_stats
+                    (timestamp, cpu, run_queue_length, context_switches, run_time_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    """, row)
+
                 conn.commit()
 
-                # Trim tables
-                limit_table_rows(conn, "system_metrics")
-                limit_table_rows(conn, "process_metrics")
-                limit_table_rows(conn, "cpu_core_stats")
+                # Trim data
+                for table in ["system_metrics", "process_metrics", "cpu_core_stats", "scheduler_stats"]:
+                    limit_table_rows(conn, table)
 
         except Exception as e:
-            print(f"[{timestamp}] Error occurred: {e}")
-            traceback.print_exc()
+            print(f"[{timestamp}] ERROR: {e}")
 
         time.sleep(SLEEP_INTERVAL)
 
