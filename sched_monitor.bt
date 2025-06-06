@@ -1,76 +1,31 @@
 #!/usr/bin/env bpftrace
 
-// --- Metric Maps ---
-@ctx_switches = count();          // Count of context switches per PID
-@latency_us = sum();              // Total latency per PID in µs
-@latency_cnt = count();           // Number of times scheduled for latency
-@run_time_ms = sum();             // Total runtime per PID in ms
-@runtime_cnt = count();           // Number of runtime measurements
-@migrations = count();            // Task migrations per PID
-@rq_len = hist();                 // Run queue length histogram
-
+// Timestamp trackers
 @ts_switch_in = {};
 @ts_wakeup = {};
 
-// --- Interval for Reporting ---
-interval:s:60 {
-    printf("\n================ Scheduler Stats (Last 60s) ================\n");
-
-    // Derived metrics
-    $ctx_total = sum(@ctx_switches);
-    $latency_total = sum(@latency_us);
-    $latency_count = sum(@latency_cnt);
-    $runtime_total = sum(@run_time_ms);
-    $runtime_count = sum(@runtime_cnt);
-
-    $avg_latency = $latency_count > 0 ? $latency_total / $latency_count : 0;
-    $avg_runtime = $runtime_count > 0 ? $runtime_total / $runtime_count : 0;
-
-    // Fairness Index (Jain’s Index): (Σx)^2 / (n * Σx^2)
-    $fair_sum = 0;
-    $fair_sq_sum = 0;
-    $n = 0;
-
-    foreach (pid in @run_time_ms) {
-        $v = @run_time_ms[pid];
-        $fair_sum += $v;
-        $fair_sq_sum += $v * $v;
-        $n += 1;
-    }
-
-    $fairness = $n > 0 && $fair_sq_sum > 0 ? ($fair_sum * $fair_sum) / ($n * $fair_sq_sum) : 0;
-
-    printf("\n📈 Derived Scheduler Efficiency Metrics:\n");
-    printf("🌀 Avg Context Switches/sec       : %d\n", $ctx_total / 60);
-    printf("⏱️  Avg Scheduling Latency (μs)   : %d\n", $avg_latency);
-    printf("⚖️  CPU Time Fairness (Jain Index): %.3f\n", $fairness);
-    printf("🕒 Avg Task Runtime (ms)           : %d\n", $avg_runtime);
-
-    // Raw metrics (histograms or counts)
-    printf("\n🌀 Context Switches per PID:\n"); print(@ctx_switches);
-    printf("\n⏱️ Total Latency (μs) per PID:\n"); print(@latency_us);
-    printf("\n🔁 Migrations per PID:\n"); print(@migrations);
-    printf("\n📊 Run Queue Length Histogram:\n"); print(@rq_len);
-    printf("\n⏳ Total Runtime per PID (ms):\n"); print(@run_time_ms);
-
-    // Clear all maps
-    clear(@ctx_switches); clear(@latency_us); clear(@latency_cnt);
-    clear(@run_time_ms); clear(@runtime_cnt); clear(@migrations);
-    clear(@rq_len); clear(@ts_switch_in); clear(@ts_wakeup);
-}
-
-// Context switches
+// Context switches per PID
 tracepoint:sched:sched_switch
 {
     @ctx_switches[args->prev_pid] += 1;
     @ts_switch_in[args->prev_pid] = nsecs;
 
     if (@ts_wakeup[args->next_pid]) {
-        $latency = (nsecs - @ts_wakeup[args->next_pid]) / 1000;
-        @latency_us[args->next_pid] += $latency;
+        $lat = (nsecs - @ts_wakeup[args->next_pid]) / 1000;
+        @latency_us[args->next_pid] += $lat;
         @latency_cnt[args->next_pid] += 1;
         delete(@ts_wakeup[args->next_pid]);
     }
+}
+
+// Runtime tracking
+tracepoint:sched:sched_switch
+/ @ts_switch_in[args->next_pid] /
+{
+    $dur = (nsecs - @ts_switch_in[args->next_pid]) / 1000000;
+    @run_time_ms[args->next_pid] += $dur;
+    @runtime_cnt[args->next_pid] += 1;
+    delete(@ts_switch_in[args->next_pid]);
 }
 
 // Wakeups
@@ -80,24 +35,65 @@ tracepoint:sched:sched_wakeup_new
     @ts_wakeup[args->pid] = nsecs;
 }
 
-// Runtime tracking
-tracepoint:sched:sched_switch
-/ @ts_switch_in[args->next_pid] /
-{
-    $runtime = (nsecs - @ts_switch_in[args->next_pid]) / 1000000;
-    @run_time_ms[args->next_pid] += $runtime;
-    @runtime_cnt[args->next_pid] += 1;
-    delete(@ts_switch_in[args->next_pid]);
-}
-
 // Migrations
 tracepoint:sched:sched_migrate_task
 {
     @migrations[args->pid] += 1;
 }
 
-// Queue length histogram
+// Run queue probe
 kprobe:run_rebalance_domains
 {
     @rq_len[cpu] = hist(cpu);
+}
+
+// Periodic report
+interval:s:60 {
+    printf("\n================ Scheduler Stats (Last 60s) ================\n");
+
+    $ctx_total = 0;
+    $lat_sum = 0; $lat_cnt = 0;
+    $rt_sum = 0; $rt_cnt = 0;
+    $fair_sum = 0; $fair_sq = 0; $n = 0;
+
+    foreach(pid in @ctx_switches) {
+        $ctx_total += @ctx_switches[pid];
+    }
+
+    foreach(pid in @latency_us) {
+        $lat_sum += @latency_us[pid];
+        $lat_cnt += @latency_cnt[pid];
+    }
+
+    foreach(pid in @run_time_ms) {
+        $v = @run_time_ms[pid];
+        $rt_sum += $v;
+        $rt_cnt += @runtime_cnt[pid];
+        $fair_sum += $v;
+        $fair_sq += $v * $v;
+        $n += 1;
+    }
+
+    $lat_avg = $lat_cnt > 0 ? $lat_sum / $lat_cnt : 0;
+    $rt_avg = $rt_cnt > 0 ? $rt_sum / $rt_cnt : 0;
+    $fairness = ($n > 0 && $fair_sq > 0) ? ($fair_sum * $fair_sum) / ($n * $fair_sq) : 0;
+
+    printf("\n📈 Derived Scheduler Metrics:\n");
+    printf("🌀 Avg Context Switches/sec       : %d\n", $ctx_total / 60);
+    printf("⏱️  Avg Scheduling Latency (μs)   : %d\n", $lat_avg);
+    printf("🕒 Avg Task Runtime (ms)           : %d\n", $rt_avg);
+    printf("⚖️  CPU Time Fairness (Jain Index): %.3f\n", $fairness);
+
+    // Raw metric outputs
+    printf("\n🌀 Context Switches:\n"); print(@ctx_switches);
+    printf("\n⏱️ Latency (μs):\n"); print(@latency_us);
+    printf("\n🔁 Migrations:\n"); print(@migrations);
+    printf("\n📊 Run Queue Histogram:\n"); print(@rq_len);
+    printf("\n⏳ Runtime per PID (ms):\n"); print(@run_time_ms);
+
+    // Clear all maps
+    clear(@ctx_switches); clear(@latency_us); clear(@latency_cnt);
+    clear(@run_time_ms); clear(@runtime_cnt);
+    clear(@ts_switch_in); clear(@ts_wakeup);
+    clear(@migrations); clear(@rq_len);
 }
