@@ -1,0 +1,119 @@
+#!/usr/bin/env bpftrace
+
+// --- Raw Metric Maps ---
+@ctx_switches = hist();      // Histogram of context switches per PID
+@latency_us = hist();        // Histogram of latency per PID
+@run_time_ms = hist();       // Histogram of runtime per PID
+@rq_len = hist();            // Run queue sample counts per CPU
+@migrations = hist();        // Task migration per PID
+
+@ts_switch_in = {};
+@ts_wakeup = {};
+
+// --- Interval for Reporting ---
+interval:s:60 {
+    printf("\n================ Scheduler Stats (Last 60s) ================\n");
+
+    // --- Derived Scheduler Metrics ---
+    $ctx_total = 0;
+    $latency_sum = 0;
+    $latency_cnt = 0;
+    $runtime_sum = 0;
+    $runtime_sqsum = 0;
+    $runtime_cnt = 0;
+    $rq_total = 0;
+    $rq_sqsum = 0;
+    $rq_cnt = 0;
+
+    // Compute derived metrics
+    foreach(k in @ctx_switches) {
+        $ctx_total += @ctx_switches[k];
+    }
+
+    foreach(k in @latency_us) {
+        $latency_sum += @latency_us[k];
+        $latency_cnt += 1;
+    }
+
+    foreach(k in @run_time_ms) {
+        $runtime_sum += @run_time_ms[k];
+        $runtime_sqsum += @run_time_ms[k] * @run_time_ms[k];
+        $runtime_cnt += 1;
+    }
+
+    foreach(k in @rq_len) {
+        $rq_total += @rq_len[k];
+        $rq_sqsum += @rq_len[k] * @rq_len[k];
+        $rq_cnt += 1;
+    }
+
+    $latency_avg = $latency_cnt > 0 ? $latency_sum / $latency_cnt : 0;
+    $runtime_avg = $runtime_cnt > 0 ? $runtime_sum / $runtime_cnt : 0;
+    $runtime_var = $runtime_cnt > 0 ? ($runtime_sqsum / $runtime_cnt) - ($runtime_avg * $runtime_avg) : 0;
+    $rq_sd = $rq_cnt > 0 ? sqrt(($rq_sqsum / $rq_cnt) - (($rq_total / $rq_cnt) * ($rq_total / $rq_cnt))) : 0;
+
+    // Jain's Fairness Index for CPU time
+    $fair_n = $runtime_cnt;
+    $fair_sum = $runtime_sum;
+    $fair_sq_sum = $runtime_sqsum;
+    $fairness = $fair_n > 0 && $fair_sq_sum > 0 ? ($fair_sum * $fair_sum) / ($fair_n * $fair_sq_sum) : 0;
+
+    // Print summary
+    printf("\n📈 Derived Scheduler Efficiency Metrics:\n");
+    printf("🌀 Avg Context Switches/sec       : %d\n", $ctx_total / 60);
+    printf("⏱️  Avg Scheduling Latency (μs)   : %d\n", $latency_avg);
+    printf("⚖️  CPU Time Fairness (Jain Index): %.3f\n", $fairness);
+    printf("📊 CPU Load Imbalance (σ rq len)  : %.2f\n", $rq_sd);
+    printf("🕒 Avg Task Runtime (ms)           : %d\n", $runtime_avg);
+
+    // Print raw data
+    printf("\n🌀 Context Switches per PID:\n"); print(@ctx_switches);
+    printf("\n⏱️ Latency (μs) per PID:\n"); print(@latency_us);
+    printf("\n🔁 Migrations per PID:\n"); print(@migrations);
+    printf("\n📊 Run Queue Samples per CPU:\n"); print(@rq_len);
+    printf("\n⏳ Runtime on CPU per PID (ms):\n"); print(@run_time_ms);
+
+    // Clear all maps
+    clear(@ctx_switches); clear(@latency_us); clear(@migrations);
+    clear(@rq_len); clear(@run_time_ms);
+    clear(@ts_switch_in); clear(@ts_wakeup);
+}
+
+// Context switches
+tracepoint:sched:sched_switch
+{
+    @ctx_switches[args->prev_pid] += 1;
+    @ts_switch_in[args->prev_pid] = nsecs;
+
+    if (@ts_wakeup[args->next_pid]) {
+        @latency_us[args->next_pid] = (nsecs - @ts_wakeup[args->next_pid]) / 1000;
+        delete(@ts_wakeup[args->next_pid]);
+    }
+}
+
+// Wakeups
+tracepoint:sched:sched_wakeup,
+tracepoint:sched:sched_wakeup_new
+{
+    @ts_wakeup[args->pid] = nsecs;
+}
+
+// Runtime calculation
+tracepoint:sched:sched_switch
+/ @ts_switch_in[args->next_pid] /
+{
+    @run_time_ms[args->next_pid] += (nsecs - @ts_switch_in[args->next_pid]) / 1000000;
+    delete(@ts_switch_in[args->next_pid]);
+}
+
+// Migrations
+tracepoint:sched:sched_migrate_task
+{
+    @migrations[args->pid] += 1;
+}
+
+// Queue length snapshot
+kprobe:run_rebalance_domains
+{
+    @rq_len[cpu] += 1;
+}
