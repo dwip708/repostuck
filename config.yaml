@@ -1,0 +1,43 @@
+audio:
+  sample_rate: 16000
+  n_fft: 400          # sr * 0.025
+  hop_length: 160     # sr * 0.01
+  n_mels: 128
+  win_length: 400
+
+features:
+  zcr: true
+  vms: true
+
+model:
+  conv2d:
+    in_channels: 3
+    out_channels: 1
+    kernel_size: 3
+    stride: 2
+  conv1d:
+    in_channels: 128
+    out_channels: 128
+    kernel_size: 3
+    stride: 2
+  linear_input: 31
+  linear_output: 128
+  dropout: 0.1
+  conformer:
+    input_dim: 128
+    num_heads: 4
+    ffn_dim: 256
+    num_layers: 8
+    depthwise_conv_kernel_size: 31
+    dropout: 0.1
+  lstm:
+    input_size: 128
+    hidden_size: 256
+    bidirectional: true
+    batch_first: true
+  fc_output: 1
+
+detection:
+  threshold: 0.064
+  min_length: 20
+  frame_shift: 0.01   # hop_length / sr (for time conversion)
