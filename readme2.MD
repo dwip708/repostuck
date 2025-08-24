@@ -55,5 +55,9 @@ This repository contains:
 
 ---
 
-## Repository Structure
+## Research Directions
 
+- Improved respiration rate estimation using foundation model embeddings (e.g., wav2vec2, HuBERT).  
+- Robust breath detection and analysis in noisy environments.  
+- Transfer learning across datasets (e.g., Coswara to ComParE/ERS).  
+- Applications in telehealth, emotion recognition, and human–computer interaction.  
